@@ -1,3 +1,5 @@
+# run as admin
+
 import os
 import sys
 from context_menu import menus
