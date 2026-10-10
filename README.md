@@ -14,6 +14,7 @@ This means it works reliably regardless of:
 - How much handwritten annotation or ink is on the page
 - Whether the PDF was inserted from Windows, Mac, or iPad OneNote
 - How much OneNote notes content sits above/around the printout
+- Whether one OneNote page holds several printout pages, or a printout page is cut in two by OneNote's page break (each printout page is detected separately, split pages are stitched back together)
 
 ## Requirements
 
