@@ -6,56 +6,95 @@ TARGET_WIDTH = 612   # 8.5in x 72
 TARGET_HEIGHT = 792  # 11in x 72
 MIN_DIM = 50          # skips tiny images like logos and stickers
 PAGE_ASPECT = TARGET_WIDTH / TARGET_HEIGHT  # ~0.773
-ASPECT_TOLERANCE = 0.25  # how far the aspect ratio can drift from a page
+PAGE_ASPECT_TOLERANCE = 0.03  # close enough to this = one whole page
+TILE_GAP = 3          # max gap between tiles of the same page
+EDGE_SLACK = 3        # how close to the page edge counts as cut off
 
-def get_printout_bbox(page, min_dim=MIN_DIM, verbose=False):
-    """bounding box of the printout images on a page, skips small decorations and stray images"""
-    candidates = []
+def get_printout_strips(page, min_dim=MIN_DIM, verbose=False):
+    """groups the printout tiles on a page into strips, one strip per printout page"""
+    tiles = []
     for info in page.get_image_info(xrefs=True):
-        b = info['bbox']
-        w, h = b[2] - b[0], b[3] - b[1]
-        if w <= min_dim or h <= min_dim:
+        b = fitz.Rect(info['bbox'])
+        if b.width <= min_dim or b.height <= min_dim:
             continue
-        aspect = w / h
-        candidates.append((b, w, h, aspect))
+        tiles.append(b)
 
     if verbose:
-        print(f"  page {page.number}: {len(candidates)} image(s) above min_dim")
-        for b, w, h, aspect in candidates:
-            print(f"    bbox={b} size=({w:.1f},{h:.1f}) aspect={aspect:.3f}")
+        print(f"  page {page.number}: {len(tiles)} tile(s) above min_dim")
 
-    if not candidates:
-        return None
-
-    # keep only page shaped images so a stray one doesn't skew the box
-    filtered = [c for c in candidates if abs(c[3] - PAGE_ASPECT) < ASPECT_TOLERANCE]
-    used = filtered if filtered else candidates  # fall back if filter kills everything
-
-    if verbose and len(used) != len(candidates):
-        print(f"    -> aspect filter dropped {len(candidates) - len(used)} image(s)")
-
-    x0 = min(b[0] for b, *_ in used)
-    y0 = min(b[1] for b, *_ in used)
-    x1 = max(b[2] for b, *_ in used)
-    y1 = max(b[3] for b, *_ in used)
-    rect = fitz.Rect(x0, y0, x1, y1)
+    tiles.sort(key=lambda r: (r.y0, r.x0))
+    strips = []
+    for t in tiles:
+        last = strips[-1] if strips else None
+        same_column = last is not None and abs(t.x0 - last.x0) < TILE_GAP and abs(t.x1 - last.x1) < TILE_GAP
+        if same_column and t.y0 - last.y1 <= TILE_GAP:
+            strips[-1] = last | t  # grow the strip downwards
+        elif last is not None and last.contains(t):
+            continue  # duplicate tile from a manual move
+        else:
+            strips.append(fitz.Rect(t))
 
     if verbose:
-        print(f"    -> final union bbox={rect} aspect={rect.width/rect.height:.3f}")
+        for s in strips:
+            print(f"    strip={s} aspect={s.width/s.height:.3f}")
+    return strips
 
-    return rect
+def is_whole_page(rect):
+    return abs(rect.width / rect.height - PAGE_ASPECT) < PAGE_ASPECT_TOLERANCE
+
+def collect_printouts(src, verbose=False):
+    """one list of (page_number, clip) pieces per printout page, page break splits get stitched"""
+    strips_per_page = [get_printout_strips(page, verbose=verbose) for page in src]
+    # onenote's top margin, the highest any printout starts
+    margin = min((s.y0 for strips in strips_per_page for s in strips), default=0)
+
+    printouts = []
+    pending = None  # printout that ran off the bottom of the last page
+    for page, strips in zip(src, strips_per_page):
+        for i, s in enumerate(strips):
+            starts_at_top = s.y0 <= margin + EDGE_SLACK
+            if pending is not None and i == 0 and starts_at_top and not is_whole_page(s):
+                # onenote repeats a band after a page break, trim it so it's not shown twice
+                prev = pending[-1][1]
+                overlap = (prev.height + s.height) - s.width / PAGE_ASPECT
+                if 0 < overlap < s.height:
+                    s = fitz.Rect(s.x0, s.y0 + overlap, s.x1, s.y1)
+                pending.append((page.number, s))
+                printouts.append(pending)
+                pending = None
+                continue
+            if pending is not None:
+                printouts.append(pending)  # nothing continued it
+                pending = None
+            runs_off_bottom = s.y1 >= page.rect.height - margin - EDGE_SLACK
+            if i == len(strips) - 1 and not is_whole_page(s) and runs_off_bottom:
+                pending = [(page.number, s)]
+            else:
+                printouts.append([(page.number, s)])
+    if pending is not None:
+        printouts.append(pending)
+    return printouts
 
 def crop_onenote_pdf(input_path, verbose=True):
     src = fitz.open(input_path)
     out = fitz.open()
-    skipped_pages = []
-    for page in src:
-        rect = get_printout_bbox(page, verbose=verbose)
-        if rect is None:
-            skipped_pages.append(page.number)
-            continue
+    printouts = collect_printouts(src, verbose=verbose)
+    pages_with_printouts = {pn for pieces in printouts for pn, _ in pieces}
+    skipped_pages = [p.number for p in src if p.number not in pages_with_printouts]
+    for pieces in printouts:
+        width = max(clip.width for _, clip in pieces)
+        height = sum(clip.height for _, clip in pieces)
+        # fit to the page without stretching, centred
+        scale = min(TARGET_WIDTH / width, TARGET_HEIGHT / height)
+        x0 = (TARGET_WIDTH - width * scale) / 2
+        y = 0
         new_page = out.new_page(width=TARGET_WIDTH, height=TARGET_HEIGHT)
-        new_page.show_pdf_page(new_page.rect, src, page.number, clip=rect)
+        for page_number, clip in pieces:
+            target = fitz.Rect(x0, y, x0 + clip.width * scale, y + clip.height * scale)
+            new_page.show_pdf_page(target, src, page_number, clip=clip)
+            y += clip.height * scale
+        if verbose and len(pieces) > 1:
+            print(f"  stitched printout from pages {[pn for pn, _ in pieces]}")
     if skipped_pages:
         print(f"warning, no printout image found on pages {skipped_pages}, skipped them")
     output_path = f"{os.path.splitext(input_path)[0]}_formatted.pdf"

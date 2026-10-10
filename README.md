@@ -15,6 +15,7 @@ This works no matter
 - how much handwriting or ink is on the page
 - whether the PDF was inserted from Windows, Mac or iPad OneNote
 - how much OneNote notes content sits above or around the printout
+- whether one OneNote page holds several printout pages, or a printout page gets cut in two by OneNote's page break (each printout page is detected separately and the split ones are stitched back together)
 
 ## requirements
 
